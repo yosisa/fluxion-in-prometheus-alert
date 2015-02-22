@@ -4,8 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/yosisa/fluxion/buffer"
 	"github.com/yosisa/fluxion/message"
 	"github.com/yosisa/fluxion/plugin"
 )
@@ -13,8 +17,10 @@ import (
 const apiPath = "/api/alerts"
 
 type Config struct {
-	Tag  string
-	Bind string
+	Tag       string
+	Bind      string
+	FirstOnly bool `toml:"first_only"`
+	TTL       buffer.Duration
 }
 
 type InPrometheusAlert struct {
@@ -30,7 +36,7 @@ func (p *InPrometheusAlert) Init(env *plugin.Env) error {
 
 func (p *InPrometheusAlert) Start() error {
 	c := make(chan error, 1)
-	http.Handle(apiPath, newAlertHandler(p.env, p.conf.Tag))
+	http.Handle(apiPath, newAlertHandler(p.env, p.conf))
 	go func() {
 		c <- http.ListenAndServe(p.conf.Bind, nil)
 	}()
@@ -47,14 +53,21 @@ func (p *InPrometheusAlert) Close() error {
 }
 
 type alertHandler struct {
-	env *plugin.Env
-	tag string
+	env       *plugin.Env
+	tag       string
+	firstOnly bool
+	ttl       time.Duration
+	seen      map[string]*time.Timer
+	m         sync.Mutex
 }
 
-func newAlertHandler(env *plugin.Env, tag string) *alertHandler {
+func newAlertHandler(env *plugin.Env, conf *Config) *alertHandler {
 	return &alertHandler{
-		env: env,
-		tag: tag,
+		env:       env,
+		tag:       conf.Tag,
+		firstOnly: conf.FirstOnly,
+		ttl:       time.Duration(conf.TTL),
+		seen:      make(map[string]*time.Timer),
 	}
 }
 
@@ -67,8 +80,53 @@ func (h *alertHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, alert := range alerts {
-		h.env.Emit(message.NewEvent(h.tag, alert))
+		seen := h.handleAlert(alert)
+		if !h.firstOnly || h.firstOnly && !seen {
+			h.env.Emit(message.NewEvent(h.tag+".active", alert))
+		}
 	}
+}
+
+func (h *alertHandler) handleAlert(alert map[string]interface{}) (seen bool) {
+	var timer *time.Timer
+	id := h.makeID(alert)
+	h.m.Lock()
+	defer h.m.Unlock()
+	timer, seen = h.seen[id]
+	if seen {
+		if timer != nil {
+			timer.Reset(h.ttl)
+		}
+		return
+	}
+	if h.ttl > 0 {
+		timer = time.AfterFunc(h.ttl, func() {
+			h.m.Lock()
+			defer h.m.Unlock()
+			h.env.Emit(message.NewEvent(h.tag+".inactive", alert))
+			delete(h.seen, id)
+		})
+	}
+	h.seen[id] = timer
+	return
+}
+
+func (h *alertHandler) makeID(alert map[string]interface{}) string {
+	labels := alert["Labels"].(map[string]interface{})
+	keys := make([]string, len(labels))
+	var i int
+	for key := range labels {
+		keys[i] = key
+		i++
+	}
+	sort.Strings(keys)
+	vals := make([]string, len(labels))
+	i = 0
+	for _, key := range keys {
+		vals[i] = fmt.Sprintf("%v", labels[key])
+		i++
+	}
+	return strings.Join(vals, ":")
 }
 
 func main() {
